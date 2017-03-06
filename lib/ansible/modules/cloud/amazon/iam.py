@@ -88,6 +88,10 @@ options:
       - A list of groups the user should belong to. When update, will gracefully remove groups not listed.
     required: false
     default: null
+  managed_policies:
+    description
+      - A list of managed policies the user or group should be associated with. 
+    default: null
   password:
     description:
       - When type is user and state is present, define the users login password. Also works with update. Note that always returns changed.
@@ -156,6 +160,15 @@ task:
         Principal:
           Service: lambda.amazonaws.com
 
+# Example of associating a managed policy with a group
+- name: Create a group and associate a managed policy with it
+  iam:
+    iam_type: group
+    name: GroupyMcGroupface
+    state: present
+    managed_policies:
+      - CustomerManagedPolicy
+      - AmazonManagedPolicy
 '''
 
 import json
@@ -436,14 +449,15 @@ new_name=None):
 
 def create_group(module=None, iam=None, name=None, path=None):
     changed = False
+    group = None
     try:
-        iam.create_group(
+        group = iam.create_group(
             name, path).create_group_response.create_group_result.group
     except boto.exception.BotoServerError as err:
         module.fail_json(changed=changed, msg=str(err))
     else:
         changed = True
-    return name, changed
+    return group, changed
 
 
 def delete_group(module=None, iam=None, name=None):
@@ -566,6 +580,7 @@ def main():
         iam_type=dict(
             default=None, required=True, choices=['user', 'group', 'role']),
         groups=dict(type='list', default=None, required=False),
+        managed_policies=dict(type='list', default=None, required=False),
         state=dict(
             default=None, required=True, choices=['present', 'absent', 'update']),
         password=dict(default=None, required=False, no_log=True),
@@ -595,6 +610,7 @@ def main():
     state = module.params.get('state').lower()
     iam_type = module.params.get('iam_type').lower()
     groups = module.params.get('groups')
+    managed_policies = module.params.get('managed_policies')
     name = module.params.get('name')
     new_name = module.params.get('new_name')
     password = module.params.get('password')
@@ -672,9 +688,14 @@ def main():
     if iam_type == 'user':
         been_updated = False
         user_groups = None
+        user_managed_policies = None
+        groups_changed = False
+        policies_changed = False
         user_exists = any([n in [name, new_name] for n in orig_user_list])
+        user = None
         if user_exists:
-            current_path = iam.get_user(name).get_user_result.user['path']
+            user = iam.get_user(name).get_user_result.user
+            current_path = user['path']
             if not new_path and current_path != path:
                 new_path = path
                 path = current_path
@@ -685,30 +706,40 @@ def main():
             keys = iam.get_all_access_keys(name).list_access_keys_result.\
                 access_key_metadata
             if groups:
-                (user_groups, changed) = set_users_groups(
+                (user_groups, groups_changed) = set_users_groups(
                     module, iam, name, groups, been_updated, new_name)
+            if managed_policies:
+                user_managed_policies, policies_changed = set_managed_policies(
+                    module, iam, meta['created_user'], managed_policies)
+
+            changed = changed or groups_changed or policies_changed
+            
             module.exit_json(
-                user_meta=meta, groups=user_groups, keys=keys, changed=changed)
+                user_meta=meta, groups=user_groups, managed_policies=user_managed_policies, keys=keys, changed=changed)
 
         elif state in ['present', 'update'] and user_exists:
             if update_pw == 'on_create':
                 password = None
             if name not in orig_user_list and new_name in orig_user_list:
                 been_updated = True
+                
             name_change, key_list, user_changed = update_user(
                 module, iam, name, new_name, new_path, key_state, key_count, key_ids, password, been_updated)
+            changed = user_changed
+            
             if name_change and new_name:
                 orig_name = name
                 name = new_name
+
             if groups:
                 user_groups, groups_changed = set_users_groups(
                     module, iam, name, groups, been_updated, new_name)
-                if groups_changed == user_changed:
-                    changed = groups_changed
-                else:
-                    changed = True
-            else:
-                changed = user_changed
+                changed = groups_changed or user_changed
+
+            if managed_policies:
+                user_managed_policies, policies_changed  = set_user_managed_policies(
+                    module, iam, user, managed_policies)
+                
             if new_name and new_path:
                 module.exit_json(changed=changed, groups=user_groups, old_user_name=orig_name,
                                  new_user_name=new_name, old_path=path, new_path=new_path, keys=key_list)
@@ -733,6 +764,7 @@ def main():
             if user_exists:
                 try:
                     set_users_groups(module, iam, name, '')
+                    set_managed_policies(module, iam, name, [])
                     del_meta, name, changed = delete_user(module, iam, name)
                     module.exit_json(deleted_user=name, changed=changed)
 
@@ -744,32 +776,39 @@ def main():
 
     elif iam_type == 'group':
         group_exists = name in orig_group_list
+        group = None
+        if group_exists:
+            group = iam.get_group(GroupName=name).get_group_response.get_group_result.group
 
         if state == 'present' and not group_exists:
             new_group, changed = create_group(module=module, iam=iam, name=name, path=path)
-            module.exit_json(changed=changed, group_name=new_group)
+            group_managed_policies, group_policies_changed = set_managed_policies(module,iam,new_group,managed_policies)
+            changed = changed or group_policies_changed
+            module.exit_json(changed=changed, group_name=new_group['GroupName'],managed_policies=group_managed_policies)
         elif state in ['present', 'update'] and group_exists:
             changed, updated_name, updated_path, cur_path = update_group(
                 module=module, iam=iam, name=name, new_name=new_name,
                 new_path=new_path)
-
+            group_managed_policies, group_policies_changed= set_managed_policies(module, iam, group, managed_policies)
+            changed = changed or group_policies_changed
+            
             if new_path and new_name:
-                module.exit_json(changed=changed, old_group_name=name,
+                module.exit_json(changed=changed, old_group_name=name,managed_policies=group_managed_policies,
                                  new_group_name=updated_name, old_path=cur_path,
                                  new_group_path=updated_path)
 
             if new_path and not new_name:
-                module.exit_json(changed=changed, group_name=name,
+                module.exit_json(changed=changed, group_name=name,managed_policies=group_managed_policies,
                                  old_path=cur_path,
                                  new_group_path=updated_path)
 
             if not new_path and new_name:
-                module.exit_json(changed=changed, old_group_name=name,
+                module.exit_json(changed=changed, old_group_name=name,managed_policies=group_managed_policies,
                                  new_group_name=updated_name, group_path=cur_path)
 
             if not new_path and not new_name:
                 module.exit_json(
-                    changed=changed, group_name=name, group_path=cur_path)
+                    changed=changed, group_name=name, group_path=cur_path,managed_policies=group_managed_policies)
 
         elif state == 'update' and not group_exists:
             module.fail_json(
@@ -777,6 +816,7 @@ def main():
 
         elif state == 'absent':
             if name in orig_group_list:
+                set_managed_policies(module,iam,group,[])
                 removed_group, changed = delete_group(module=module, iam=iam, name=name)
                 module.exit_json(changed=changed, delete_group=removed_group)
             else:
@@ -784,10 +824,16 @@ def main():
 
     elif iam_type == 'role':
         role_list = []
+        try:
+            role = iam.get_role(RoleName=name).get_role_response.get_role_result.role
+        except:
+            role = None
         if state == 'present':
             changed, role_list, role_result, instance_profile_result = create_role(
                 module, iam, name, path, orig_role_list, orig_prof_list, trust_policy_doc)
+            set_managed_policies(module, iam, policy, managed_policies)
         elif state == 'absent':
+            set_managed_policies(module, iam, policy, [])
             changed, role_list, role_result, instance_profile_result = delete_role(
                 module, iam, name, orig_role_list, orig_prof_list)
         elif state == 'update':
